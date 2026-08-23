@@ -1,0 +1,321 @@
+//@version=5
+// ============================================================================
+// Trend Pullback + Momentum Confirmation — VERSION BACKTESTABLE (strategy)
+// XAUUSD / US30 — M5 à M15
+//
+// Reprend exactement la logique d'entrée de indicators/scalping_signals.pine
+// et y ajoute la mécanique de backtest : sizing basé sur le risque, sorties
+// partielles (TP1 50% / TP2 25% / runner 25%), passage à breakeven après TP1,
+// trailing ATR sur le runner, filtres de session, plage de dates, limite de
+// trades par jour et stop journalier.
+//
+// AVERTISSEMENT : un backtest n'est pas une preuve de rentabilité future.
+// Les résultats dépendent fortement du spread, du slippage et de la qualité
+// des données intraday de votre broker. Voir la section "Limites du backtest"
+// en bas de ce fichier avant d'interpréter les résultats.
+// ============================================================================
+
+strategy("Scalping Strategy - Trend Pullback + Momentum (XAUUSD/US30)",
+     overlay              = true,
+     initial_capital      = 10000,
+     currency             = currency.USD,
+     default_qty_type     = strategy.fixed,
+     default_qty_value    = 1,
+     commission_type      = strategy.commission.cash_per_contract,
+     commission_value     = 0.0,
+     slippage             = 2,
+     calc_on_every_tick   = false,
+     process_orders_on_close = true,
+     max_labels_count     = 500)
+
+// ----------------------------------------------------------------------------
+// INPUTS — logique d'entrée (identiques à l'indicateur)
+// ----------------------------------------------------------------------------
+grpHTF = "Biais de tendance (HTF)"
+htfTimeframe = input.timeframe("60", "Timeframe biais (H1 recommandé)", group=grpHTF)
+emaFastLen   = input.int(50,  "EMA rapide (HTF)", minval=1, group=grpHTF)
+emaSlowLen   = input.int(200, "EMA lente (HTF)",  minval=1, group=grpHTF)
+
+grpPullback = "Pullback / structure locale"
+emaPullbackLen = input.int(21, "EMA pullback (locale)", minval=1, group=grpPullback)
+swingLookback  = input.int(10, "Lookback swing (barres) pour SL", minval=2, group=grpPullback)
+
+grpFilter = "Filtre de force de tendance (ADX/DMI)"
+adxLen       = input.int(14, "Longueur ADX/DMI", minval=1, group=grpFilter)
+adxThreshold = input.float(22.0, "Seuil ADX minimum (20-25)", minval=0, group=grpFilter)
+
+grpMomentum = "Momentum (RSI)"
+rsiLen        = input.int(14, "Longueur RSI", minval=1, group=grpMomentum)
+rsiOversold   = input.int(30, "Niveau survente RSI", minval=1, maxval=50, group=grpMomentum)
+rsiOverbought = input.int(70, "Niveau surachat RSI", minval=50, maxval=99, group=grpMomentum)
+
+// ----------------------------------------------------------------------------
+// INPUTS — gestion du risque et des sorties
+// ----------------------------------------------------------------------------
+grpRisk = "Gestion du risque"
+riskPct     = input.float(1.0, "Risque par trade (% du capital)", minval=0.1, maxval=5.0, step=0.1, group=grpRisk)
+atrLen      = input.int(14, "Longueur ATR", minval=1, group=grpRisk)
+atrMult     = input.float(1.0, "Multiplicateur ATR (buffer SL)", minval=0.1, step=0.1, group=grpRisk)
+rrTP1       = input.float(1.0, "RR TP1 (sortie 50%)", minval=0.1, step=0.1, group=grpRisk)
+rrTP2       = input.float(2.0, "RR TP2 (sortie 25%)", minval=0.1, step=0.1, group=grpRisk)
+trailMult   = input.float(1.5, "Multiplicateur ATR trailing (runner 25%)", minval=0.1, step=0.1, group=grpRisk)
+useBreakeven = input.bool(true, "Passer le SL à breakeven après TP1", group=grpRisk)
+
+grpLimits = "Limites de trading"
+maxTradesPerDay  = input.int(3, "Nombre max de trades par jour", minval=1, group=grpLimits)
+maxDailyLossPct  = input.float(3.0, "Stop journalier (% de perte)", minval=0.5, step=0.5, group=grpLimits)
+
+// ----------------------------------------------------------------------------
+// INPUTS — filtres de session et de dates
+// ----------------------------------------------------------------------------
+grpSession = "Filtre de session"
+useSessionFilter = input.bool(true, "Activer le filtre de session", group=grpSession)
+sessionTz  = input.string("Europe/Paris", "Fuseau horaire", group=grpSession)
+session1   = input.session("0900-1130", "Session 1 (ouverture Londres)", group=grpSession)
+session2   = input.session("1430-1700", "Session 2 (chevauchement Londres/NY)", group=grpSession)
+closeAtSessionEnd = input.bool(true, "Clôturer les positions en fin de session", group=grpSession)
+
+grpDates = "Plage de backtest"
+startDate = input.time(timestamp("01 Jan 2024 00:00 +0000"), "Début", group=grpDates)
+endDate   = input.time(timestamp("01 Jan 2030 00:00 +0000"), "Fin", group=grpDates)
+
+// ----------------------------------------------------------------------------
+// BIAIS DE TENDANCE HTF
+// ----------------------------------------------------------------------------
+htfEmaFast = request.security(syminfo.tickerid, htfTimeframe, ta.ema(close, emaFastLen), lookahead=barmerge.lookahead_off)
+htfEmaSlow = request.security(syminfo.tickerid, htfTimeframe, ta.ema(close, emaSlowLen), lookahead=barmerge.lookahead_off)
+htfClose   = request.security(syminfo.tickerid, htfTimeframe, close, lookahead=barmerge.lookahead_off)
+
+biasBullish = htfEmaFast > htfEmaSlow and htfClose > htfEmaFast
+biasBearish = htfEmaFast < htfEmaSlow and htfClose < htfEmaFast
+
+// ----------------------------------------------------------------------------
+// PULLBACK LOCAL + STRUCTURE
+// ----------------------------------------------------------------------------
+emaPullback = ta.ema(close, emaPullbackLen)
+
+nearPullbackLong  = low  <= emaPullback and close >= emaPullback
+nearPullbackShort = high >= emaPullback and close <= emaPullback
+
+swingLow  = ta.lowest(low, swingLookback)
+swingHigh = ta.highest(high, swingLookback)
+
+// ----------------------------------------------------------------------------
+// FILTRE ADX/DMI
+// ----------------------------------------------------------------------------
+[diPlus, diMinus, adxValue] = ta.dmi(adxLen, adxLen)
+adxOk = adxValue > adxThreshold
+
+// ----------------------------------------------------------------------------
+// MOMENTUM + PATTERNS + CASSURE DE STRUCTURE
+// ----------------------------------------------------------------------------
+rsiValue = ta.rsi(close, rsiLen)
+rsiExitOversold   = rsiValue > rsiOversold   and rsiValue[1] <= rsiOversold
+rsiExitOverbought = rsiValue < rsiOverbought and rsiValue[1] >= rsiOverbought
+
+bullEngulfing = close[1] < open[1] and close > open and close >= open[1] and open <= close[1]
+bearEngulfing = close[1] > open[1] and close < open and close <= open[1] and open >= close[1]
+
+microHigh = ta.highest(high[1], swingLookback)
+microLow  = ta.lowest(low[1], swingLookback)
+structureBreakUp   = close > microHigh
+structureBreakDown = close < microLow
+
+confirmLong  = bullEngulfing or rsiExitOversold   or structureBreakUp
+confirmShort = bearEngulfing or rsiExitOverbought or structureBreakDown
+
+// ----------------------------------------------------------------------------
+// SIGNAUX
+// ----------------------------------------------------------------------------
+atrValue = ta.atr(atrLen)
+
+longSignal  = biasBullish and nearPullbackLong  and adxOk and confirmLong
+shortSignal = biasBearish and nearPullbackShort and adxOk and confirmShort
+
+// ----------------------------------------------------------------------------
+// FILTRES D'AUTORISATION DE TRADING
+// ----------------------------------------------------------------------------
+inSession1 = not na(time(timeframe.period, session1, sessionTz))
+inSession2 = not na(time(timeframe.period, session2, sessionTz))
+inSession  = not useSessionFilter or inSession1 or inSession2
+
+inDateRange = time >= startDate and time <= endDate
+
+// Compteur de trades du jour et equity de début de journée
+newDay = ta.change(time("D")) != 0
+
+var int   tradesToday    = 0
+var float dayStartEquity = na
+
+if newDay
+    tradesToday    := 0
+    dayStartEquity := strategy.equity
+
+if na(dayStartEquity)
+    dayStartEquity := strategy.equity
+
+dailyLossHit = strategy.equity <= dayStartEquity * (1.0 - maxDailyLossPct / 100.0)
+
+canTrade = inSession and inDateRange and tradesToday < maxTradesPerDay and not dailyLossHit
+
+// ----------------------------------------------------------------------------
+// NIVEAUX SL/TP ET CALCUL DE LA TAILLE DE POSITION
+// ----------------------------------------------------------------------------
+longSL   = swingLow - atrValue * atrMult
+longRisk = close - longSL
+
+shortSL   = swingHigh + atrValue * atrMult
+shortRisk = shortSL - close
+
+// Taille = risque monétaire / (distance au stop x valeur du point)
+riskAmount = strategy.equity * riskPct / 100.0
+qtyLong  = longRisk  > 0 ? riskAmount / (longRisk  * syminfo.pointvalue) : 0.0
+qtyShort = shortRisk > 0 ? riskAmount / (shortRisk * syminfo.pointvalue) : 0.0
+
+// ----------------------------------------------------------------------------
+// ETAT DE LA POSITION EN COURS
+// ----------------------------------------------------------------------------
+var float entryPrice   = na
+var float stopLevel    = na
+var float tp1Level     = na
+var float tp2Level     = na
+var float initialQty   = na
+var float runnerStop   = na
+var bool  tp1Filled    = false
+var bool  tp2Filled    = false
+
+flat = strategy.position_size == 0
+
+// ----------------------------------------------------------------------------
+// ENTREES
+// ----------------------------------------------------------------------------
+enterLong  = longSignal  and canTrade and flat and qtyLong  > 0
+enterShort = shortSignal and canTrade and flat and qtyShort > 0
+
+if enterLong
+    strategy.entry("Long", strategy.long, qty=qtyLong)
+    entryPrice  := close
+    stopLevel   := longSL
+    tp1Level    := close + longRisk * rrTP1
+    tp2Level    := close + longRisk * rrTP2
+    initialQty  := qtyLong
+    runnerStop  := longSL
+    tp1Filled   := false
+    tp2Filled   := false
+    tradesToday := tradesToday + 1
+
+if enterShort
+    strategy.entry("Short", strategy.short, qty=qtyShort)
+    entryPrice  := close
+    stopLevel   := shortSL
+    tp1Level    := close - shortRisk * rrTP1
+    tp2Level    := close - shortRisk * rrTP2
+    initialQty  := qtyShort
+    runnerStop  := shortSL
+    tp1Filled   := false
+    tp2Filled   := false
+    tradesToday := tradesToday + 1
+
+// ----------------------------------------------------------------------------
+// GESTION DES SORTIES
+// ----------------------------------------------------------------------------
+// Détection des TP atteints (cohérente avec le remplissage d'un ordre limite)
+if strategy.position_size > 0
+    if not tp1Filled and high >= tp1Level
+        tp1Filled := true
+        if useBreakeven
+            stopLevel := entryPrice
+    if not tp2Filled and high >= tp2Level
+        tp2Filled := true
+    // Trailing ATR sur le runner une fois TP2 atteint
+    if tp2Filled
+        float candidateLong = close - atrValue * trailMult
+        runnerStop := math.max(nz(runnerStop, stopLevel), candidateLong)
+    else
+        runnerStop := stopLevel
+
+if strategy.position_size < 0
+    if not tp1Filled and low <= tp1Level
+        tp1Filled := true
+        if useBreakeven
+            stopLevel := entryPrice
+    if not tp2Filled and low <= tp2Level
+        tp2Filled := true
+    if tp2Filled
+        float candidateShort = close + atrValue * trailMult
+        runnerStop := math.min(nz(runnerStop, stopLevel), candidateShort)
+    else
+        runnerStop := stopLevel
+
+// Placement / mise à jour des ordres de sortie
+if strategy.position_size > 0
+    if not tp1Filled
+        strategy.exit("L-TP1", from_entry="Long", qty=initialQty * 0.50, limit=tp1Level, stop=stopLevel)
+    if not tp2Filled
+        strategy.exit("L-TP2", from_entry="Long", qty=initialQty * 0.25, limit=tp2Level, stop=stopLevel)
+    strategy.exit("L-RUN", from_entry="Long", stop=runnerStop)
+
+if strategy.position_size < 0
+    if not tp1Filled
+        strategy.exit("S-TP1", from_entry="Short", qty=initialQty * 0.50, limit=tp1Level, stop=stopLevel)
+    if not tp2Filled
+        strategy.exit("S-TP2", from_entry="Short", qty=initialQty * 0.25, limit=tp2Level, stop=stopLevel)
+    strategy.exit("S-RUN", from_entry="Short", stop=runnerStop)
+
+// Clôture en fin de session (évite de porter une position de scalping hors session)
+if closeAtSessionEnd and useSessionFilter and not inSession and strategy.position_size != 0
+    strategy.close_all(comment="Fin de session")
+
+// Clôture si le stop journalier est atteint
+if dailyLossHit and strategy.position_size != 0
+    strategy.close_all(comment="Stop journalier")
+
+// Réinitialisation de l'état quand on repasse à plat
+if strategy.position_size == 0 and not enterLong and not enterShort
+    entryPrice := na
+    stopLevel  := na
+    tp1Level   := na
+    tp2Level   := na
+    initialQty := na
+    runnerStop := na
+    tp1Filled  := false
+    tp2Filled  := false
+
+// ----------------------------------------------------------------------------
+// VISUALISATION
+// ----------------------------------------------------------------------------
+plot(emaPullback, "EMA Pullback (locale)", color=color.orange, linewidth=1)
+plot(htfEmaFast,  "EMA rapide HTF", color=color.blue, linewidth=1)
+plot(htfEmaSlow,  "EMA lente HTF",  color=color.red,  linewidth=1)
+
+plot(strategy.position_size != 0 ? stopLevel  : na, "Stop actif", color=color.red,   style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size != 0 ? tp1Level   : na, "TP1",        color=color.lime,  style=plot.style_linebr, linewidth=1)
+plot(strategy.position_size != 0 ? tp2Level   : na, "TP2",        color=color.green, style=plot.style_linebr, linewidth=1)
+plot(strategy.position_size != 0 and tp2Filled ? runnerStop : na, "Trailing runner", color=color.purple, style=plot.style_linebr, linewidth=1)
+
+bgcolor(inSession and useSessionFilter ? color.new(color.blue, 95) : na, title="Session de trading")
+
+// ============================================================================
+// LIMITES DU BACKTEST — à lire avant d'interpréter les résultats
+// ============================================================================
+// 1. Ordre intrabarre inconnu : sur une bougie où le SL et le TP sont tous
+//    deux touchés, TradingView ne sait pas lequel est arrivé en premier.
+//    Activez "Recalculate on bar close" et testez avec l'option
+//    "Use bar magnifier" (abonnement payant) pour un remplissage plus fidèle.
+// 2. Spread non modélisé : TradingView ne simule pas le spread. Sur XAUUSD et
+//    US30 il est significatif en scalping. Compensez via le paramètre
+//    "slippage" (en ticks) et/ou la commission dans les propriétés
+//    de la stratégie, sinon les résultats seront trop optimistes.
+// 3. Historique intraday limité : TradingView limite l'historique en M5/M15
+//    selon l'abonnement. Un backtest sur trop peu de trades (< 100) n'a pas
+//    de valeur statistique.
+// 4. Sizing : le calcul suppose que syminfo.pointvalue reflète correctement la
+//    valeur du point chez votre broker. Vérifiez-la pour votre instrument
+//    (CFD, futures, spot) avant de vous fier aux montants affichés.
+// 5. Le trailing du runner est calculé sur la clôture de bougie, pas en
+//    continu — un trailing broker réel se comportera différemment.
+//
+// Méthode de validation recommandée : backtest sur au moins 100-150 trades,
+// puis forward-test en démo 2-4 semaines, puis comparez winrate et RR moyen
+// réels à ceux du backtest avant d'engager du capital.
+// ============================================================================

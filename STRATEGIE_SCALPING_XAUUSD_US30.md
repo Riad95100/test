@@ -149,6 +149,17 @@ Ne jamais passer directement en réel après avoir lu une stratégie. Étapes re
 
 ---
 
-## 10. Rappel final
+## 10. Fichiers TradingView fournis
+
+| Fichier | Type | Usage |
+|---------|------|-------|
+| `indicators/scalping_signals.pine` | `indicator()` | Visualiser les signaux en direct sur le graphique, avec labels SL/TP et alertes |
+| `strategies/scalping_strategy.pine` | `strategy()` | Backtester la stratégie : sizing basé sur le risque, sorties partielles TP1/TP2/runner, breakeven, trailing ATR, filtres de session et plage de dates |
+
+Les deux fichiers partagent exactement la même logique d'entrée. La version `strategy()` ajoute la mécanique d'exécution et de gestion de position nécessaire au backtest — lisez la section « Limites du backtest » en bas de `strategies/scalping_strategy.pine` avant d'interpréter les résultats (spread non modélisé, ordre intrabarre inconnu, historique intraday limité).
+
+---
+
+## 11. Rappel final
 
 Cette stratégie est un **cadre de travail**, pas une martingale garantie. Le winrate et le RR réels dépendent de la discipline d'exécution, des conditions de marché, du spread/slippage du broker, et de la gestion émotionnelle du trader. **Validez toujours en démo avant d'engager du capital réel**, et n'investissez jamais plus que ce que vous êtes prêt à perdre.
