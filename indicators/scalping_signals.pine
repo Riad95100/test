@@ -1,0 +1,138 @@
+//@version=5
+// Trend Pullback + Momentum Confirmation — scalping signal indicator
+// For XAUUSD / US30 on M5-M15. Educational use only, no profit guarantee.
+indicator("Scalping Signals - Trend Pullback + Momentum (XAUUSD/US30)", overlay=true, max_labels_count=500)
+
+// ----------------------------------------------------------------------------
+// INPUTS
+// ----------------------------------------------------------------------------
+grpHTF = "Biais de tendance (HTF)"
+htfTimeframe = input.timeframe("60", "Timeframe biais (H1 recommandé)", group=grpHTF)
+emaFastLen   = input.int(50,  "EMA rapide (HTF)",  minval=1, group=grpHTF)
+emaSlowLen   = input.int(200, "EMA lente (HTF)",   minval=1, group=grpHTF)
+
+grpPullback = "Pullback / structure locale"
+emaPullbackLen = input.int(21, "EMA pullback (locale)", minval=1, group=grpPullback)
+swingLookback  = input.int(10, "Lookback swing (barres) pour SL", minval=2, group=grpPullback)
+
+grpFilter = "Filtre de force de tendance (ADX/DMI)"
+adxLen   = input.int(14, "Longueur ADX/DMI", minval=1, group=grpFilter)
+adxThreshold = input.float(22.0, "Seuil ADX minimum (20-25)", minval=0, group=grpFilter)
+
+grpMomentum = "Momentum (RSI)"
+rsiLen = input.int(14, "Longueur RSI", minval=1, group=grpMomentum)
+rsiOversold = input.int(30, "Niveau survente RSI", minval=1, maxval=50, group=grpMomentum)
+rsiOverbought = input.int(70, "Niveau surachat RSI", minval=50, maxval=99, group=grpMomentum)
+
+grpRisk = "Stop Loss / Take Profit (indicatif)"
+atrLen = input.int(14, "Longueur ATR", minval=1, group=grpRisk)
+atrMult = input.float(1.0, "Multiplicateur ATR pour buffer SL", minval=0.1, step=0.1, group=grpRisk)
+rrTP1 = input.float(1.0, "RR TP1", minval=0.1, step=0.1, group=grpRisk)
+rrTP2 = input.float(2.0, "RR TP2", minval=0.1, step=0.1, group=grpRisk)
+rrTP3 = input.float(3.0, "RR TP3 (référence trailing)", minval=0.1, step=0.1, group=grpRisk)
+
+grpDisplay = "Affichage"
+showLabels = input.bool(true, "Afficher labels SL/TP", group=grpDisplay)
+showEmas   = input.bool(true, "Afficher EMA sur le graphique", group=grpDisplay)
+
+// ----------------------------------------------------------------------------
+// BIAIS DE TENDANCE HTF (H1 via request.security)
+// ----------------------------------------------------------------------------
+htfEmaFast = request.security(syminfo.tickerid, htfTimeframe, ta.ema(close, emaFastLen), lookahead=barmerge.lookahead_off)
+htfEmaSlow = request.security(syminfo.tickerid, htfTimeframe, ta.ema(close, emaSlowLen), lookahead=barmerge.lookahead_off)
+htfClose   = request.security(syminfo.tickerid, htfTimeframe, close, lookahead=barmerge.lookahead_off)
+
+biasBullish = htfEmaFast > htfEmaSlow and htfClose > htfEmaFast
+biasBearish = htfEmaFast < htfEmaSlow and htfClose < htfEmaFast
+
+// ----------------------------------------------------------------------------
+// PULLBACK LOCAL (EMA21) + STRUCTURE
+// ----------------------------------------------------------------------------
+emaPullback = ta.ema(close, emaPullbackLen)
+
+// Zone de pullback : le prix touche/traverse l'EMA21 récemment (tolérance = mèche haute/basse)
+nearPullbackLong  = low  <= emaPullback and close >= emaPullback
+nearPullbackShort = high >= emaPullback and close <= emaPullback
+
+// Swing local pour le calcul du SL
+swingLow  = ta.lowest(low, swingLookback)
+swingHigh = ta.highest(high, swingLookback)
+
+// ----------------------------------------------------------------------------
+// FILTRE ADX/DMI — force de tendance
+// ----------------------------------------------------------------------------
+[diPlus, diMinus, adxValue] = ta.dmi(adxLen, adxLen)
+adxOk = adxValue > adxThreshold
+
+// ----------------------------------------------------------------------------
+// MOMENTUM — RSI sortie de zone extrême
+// ----------------------------------------------------------------------------
+rsiValue = ta.rsi(close, rsiLen)
+rsiExitOversold   = rsiValue > rsiOversold   and rsiValue[1] <= rsiOversold
+rsiExitOverbought = rsiValue < rsiOverbought and rsiValue[1] >= rsiOverbought
+
+// ----------------------------------------------------------------------------
+// PATTERN DE BOUGIE — engulfing simple
+// ----------------------------------------------------------------------------
+bullEngulfing = close[1] < open[1] and close > open and close >= open[1] and open <= close[1]
+bearEngulfing = close[1] > open[1] and close < open and close <= open[1] and open >= close[1]
+
+// ----------------------------------------------------------------------------
+// CASSURE DE MICRO-STRUCTURE
+// ----------------------------------------------------------------------------
+microHigh = ta.highest(high[1], swingLookback)
+microLow  = ta.lowest(low[1], swingLookback)
+structureBreakUp   = close > microHigh
+structureBreakDown = close < microLow
+
+// ----------------------------------------------------------------------------
+// CONFIRMATION D'ENTREE : au moins un signal parmi les trois
+// ----------------------------------------------------------------------------
+confirmLong  = bullEngulfing or rsiExitOversold   or structureBreakUp
+confirmShort = bearEngulfing or rsiExitOverbought or structureBreakDown
+
+// ----------------------------------------------------------------------------
+// SIGNAUX FINAUX
+// ----------------------------------------------------------------------------
+atrValue = ta.atr(atrLen)
+
+longSignal  = biasBullish and nearPullbackLong  and adxOk and confirmLong
+shortSignal = biasBearish and nearPullbackShort and adxOk and confirmShort
+
+// SL/TP indicatifs
+longSL  = swingLow  - atrValue * atrMult
+longRisk = close - longSL
+longTP1 = close + longRisk * rrTP1
+longTP2 = close + longRisk * rrTP2
+longTP3 = close + longRisk * rrTP3
+
+shortSL  = swingHigh + atrValue * atrMult
+shortRisk = shortSL - close
+shortTP1 = close - shortRisk * rrTP1
+shortTP2 = close - shortRisk * rrTP2
+shortTP3 = close - shortRisk * rrTP3
+
+// ----------------------------------------------------------------------------
+// PLOTS
+// ----------------------------------------------------------------------------
+plot(showEmas ? emaPullback : na, "EMA Pullback (locale)", color=color.orange, linewidth=1)
+plot(showEmas ? htfEmaFast : na,  "EMA rapide HTF", color=color.blue, linewidth=1)
+plot(showEmas ? htfEmaSlow : na,  "EMA lente HTF",  color=color.red,  linewidth=1)
+
+plotshape(longSignal, title="BUY", style=shape.triangleup, location=location.belowbar, color=color.new(color.green, 0), size=size.small, text="BUY")
+plotshape(shortSignal, title="SELL", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), size=size.small, text="SELL")
+
+if showLabels and longSignal
+    label.new(bar_index, longSL, text="BUY\nSL: " + str.tostring(longSL, format.mintick) + "\nTP1: " + str.tostring(longTP1, format.mintick) + "\nTP2: " + str.tostring(longTP2, format.mintick) + "\nTP3: " + str.tostring(longTP3, format.mintick), style=label.style_label_up, color=color.new(color.green, 80), textcolor=color.green, size=size.small)
+
+if showLabels and shortSignal
+    label.new(bar_index, shortSL, text="SELL\nSL: " + str.tostring(shortSL, format.mintick) + "\nTP1: " + str.tostring(shortTP1, format.mintick) + "\nTP2: " + str.tostring(shortTP2, format.mintick) + "\nTP3: " + str.tostring(shortTP3, format.mintick), style=label.style_label_down, color=color.new(color.red, 80), textcolor=color.red, size=size.small)
+
+// Fond coloré discret pour visualiser le biais de tendance HTF
+bgcolor(biasBullish ? color.new(color.green, 95) : biasBearish ? color.new(color.red, 95) : na, title="Biais de tendance HTF")
+
+// ----------------------------------------------------------------------------
+// ALERTES
+// ----------------------------------------------------------------------------
+alertcondition(longSignal,  title="Signal BUY",  message="Scalping BUY signal ({{ticker}} {{interval}}) - Trend Pullback + Momentum")
+alertcondition(shortSignal, title="Signal SELL", message="Scalping SELL signal ({{ticker}} {{interval}}) - Trend Pullback + Momentum")
