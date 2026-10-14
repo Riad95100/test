@@ -1,5 +1,5 @@
 //@version=5
-// Liquidity Levels — BSL/SSL (swings), EQH/EQL, PDH/PDL, PWH/PWL, PMH/PML
+// Liquidity Levels — BSL/SSL (swings), EQH/EQL, PDH/PDL, PWH/PWL, PMH/PML, plages de sessions
 // Fonctionne sur n'importe quel symbole / timeframe (forex, indices, or, crypto, actions...).
 // Usage éducatif uniquement, aucune garantie de performance.
 //
@@ -8,8 +8,9 @@
 //   SSL  = Sell-Side Liquidity : stops en dessous d'un plus bas (swing low)
 //   EQH / EQL = Equal Highs / Equal Lows (plusieurs extrêmes au même niveau = liquidité plus dense)
 //   PDH/PDL, PWH/PWL, PMH/PML = plus haut / plus bas du jour, de la semaine, du mois précédents
+//   Asia/London/NY H & L = plus haut / plus bas de chaque session, actifs jusqu'au sweep
 //   Un niveau est "balayé" (swept) quand le prix le dépasse : la ligne s'arrête et passe en gris.
-indicator("Liquidity Levels (BSL/SSL, EQH/EQL, PDH/PDL)", shorttitle="Liquidity", overlay=true, max_lines_count=500, max_labels_count=500)
+indicator("Liquidity Levels (BSL/SSL, EQH/EQL, PDH/PDL, Sessions)", shorttitle="Liquidity", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=100)
 
 // ----------------------------------------------------------------------------
 // INPUTS
@@ -35,6 +36,20 @@ showPD = input.bool(true, "Jour précédent (PDH / PDL)", group=grpPeriod)
 showPW = input.bool(true, "Semaine précédente (PWH / PWL)", group=grpPeriod)
 showPM = input.bool(true, "Mois précédent (PMH / PML)", group=grpPeriod)
 
+grpSess = "Sessions (timeframes intraday uniquement)"
+sessTz     = input.string("UTC", "Fuseau horaire des sessions", options=["UTC", "Europe/London", "Europe/Paris", "America/New_York", "Asia/Tokyo"], group=grpSess)
+showAsia   = input.bool(true, "Session Asie", inline="asia", group=grpSess)
+asiaSess   = input.session("0000-0800", "", inline="asia", group=grpSess)
+showLondon = input.bool(true, "Session Londres", inline="lon", group=grpSess)
+londonSess = input.session("0700-1600", "", inline="lon", group=grpSess)
+showNY     = input.bool(true, "Session New York", inline="ny", group=grpSess)
+nySess     = input.session("1200-2100", "", inline="ny", group=grpSess)
+showBox    = input.bool(true, "Dessiner la plage de chaque session (boîte)", group=grpSess)
+maxSess    = input.int(2, "Niveaux actifs max par session et par côté", minval=1, maxval=10, group=grpSess)
+colAsia    = input.color(#9C27B0, "Couleur Asie", group=grpSess)
+colLondon  = input.color(#2962FF, "Couleur Londres", group=grpSess)
+colNY      = input.color(#EC407A, "Couleur New York", group=grpSess)
+
 grpStyle = "Style"
 colBSL     = input.color(#F23645, "Couleur BSL / EQH", group=grpStyle)
 colSSL     = input.color(#089981, "Couleur SSL / EQL", group=grpStyle)
@@ -49,15 +64,19 @@ labelOffset = input.int(3, "Décalage des labels à droite (barres)", minval=0, 
 // TYPES / ÉTAT
 // ----------------------------------------------------------------------------
 type Liq
-    float price
-    bool  isHigh
-    bool  isEq
-    line  ln
-    label lb
+    float  price
+    bool   isHigh
+    bool   isEq
+    string tag     // "" pour un swing, sinon "Asia H", "London L", ...
+    color  col     // couleur propre aux niveaux de session
+    line   ln
+    label  lb
 
-var array<Liq> highs = array.new<Liq>()   // BSL / EQH actifs
-var array<Liq> lows  = array.new<Liq>()   // SSL / EQL actifs
-var array<Liq> done  = array.new<Liq>()   // niveaux balayés conservés à l'écran
+var array<Liq> highs     = array.new<Liq>()   // BSL / EQH actifs
+var array<Liq> lows      = array.new<Liq>()   // SSL / EQL actifs
+var array<Liq> sessHighs = array.new<Liq>()   // plus hauts de session actifs
+var array<Liq> sessLows  = array.new<Liq>()   // plus bas de session actifs
+var array<Liq> done      = array.new<Liq>()   // niveaux balayés conservés à l'écran
 
 bool sweepOnClose = sweepMode == "Clôture (break)"
 float srcHi = sweepOnClose ? close : high
@@ -71,28 +90,42 @@ f_lineStyle(string s) =>
     s == "Pointillé" ? line.style_dotted : s == "Tirets" ? line.style_dashed : line.style_solid
 
 f_name(Liq l) =>
-    l.isHigh ? (l.isEq ? "EQH" : "BSL") : (l.isEq ? "EQL" : "SSL")
+    l.tag != "" ? l.tag : l.isHigh ? (l.isEq ? "EQH" : "BSL") : (l.isEq ? "EQL" : "SSL")
 
 f_paint(Liq l) =>
-    color c = l.isHigh ? colBSL : colSSL
+    color c = l.tag != "" ? l.col : l.isHigh ? colBSL : colSSL
     line.set_color(l.ln, c)
     line.set_width(l.ln, l.isEq ? lineWidth + 1 : lineWidth)
     line.set_style(l.ln, f_lineStyle(lineStyle))
     label.set_text(l.lb, f_name(l))
     label.set_textcolor(l.lb, c)
 
-f_new(float price, bool isHigh, bool isEq) =>
-    line ln = line.new(bar_index - swingLen, price, bar_index, price, extend=extend.right)
+f_new(float price, bool isHigh, bool isEq, int x1, string tag, color col) =>
+    line ln = line.new(x1, price, bar_index, price, extend=extend.right)
     label lb = label.new(bar_index, price, "", color=color(na), style=label.style_label_left, size=lblSize)
-    Liq l = Liq.new(price, isHigh, isEq, ln, lb)
+    Liq l = Liq.new(price, isHigh, isEq, tag, col, ln, lb)
     f_paint(l)
     l
 
-f_trim(array<Liq> arr) =>
-    while array.size(arr) > maxLevels
+f_trim(array<Liq> arr, int mx) =>
+    while array.size(arr) > mx
         Liq o = array.shift(arr)
         line.delete(o.ln)
         label.delete(o.lb)
+
+// Ne garde que les mx niveaux les plus récents portant ce tag
+f_trimTag(array<Liq> arr, string tag, int mx) =>
+    int cnt = 0
+    int i = array.size(arr) - 1
+    while i >= 0
+        Liq l = array.get(arr, i)
+        if l.tag == tag
+            cnt += 1
+            if cnt > mx
+                array.remove(arr, i)
+                line.delete(l.ln)
+                label.delete(l.lb)
+        i -= 1
 
 f_retire(Liq l) =>
     if showSwept
@@ -127,6 +160,35 @@ f_sweep(array<Liq> arr, bool isHigh) =>
         i -= 1
     hit
 
+// Suit la plage d'une session ; à sa fin, son plus haut et son plus bas deviennent des niveaux de liquidité
+f_session(string nm, string sess, bool show, color col) =>
+    bool inS = show and timeframe.isintraday and not na(time(timeframe.period, sess + ":1234567", sessTz))
+    var bool wasIn = false
+    var float sh = na
+    var float sl = na
+    var int sBar = na
+    var box bx = na
+    if inS
+        if not wasIn
+            sh := high
+            sl := low
+            sBar := bar_index
+            if showBox
+                bx := box.new(bar_index, high, bar_index, low, border_color=col, bgcolor=color.new(col, 90))
+        else
+            sh := math.max(sh, high)
+            sl := math.min(sl, low)
+            if showBox
+                box.set_right(bx, bar_index)
+                box.set_top(bx, sh)
+                box.set_bottom(bx, sl)
+    else if wasIn
+        array.push(sessHighs, f_new(sh, true, false, sBar, nm + " H", col))
+        array.push(sessLows, f_new(sl, false, false, sBar, nm + " L", col))
+        f_trimTag(sessHighs, nm + " H", maxSess)
+        f_trimTag(sessLows, nm + " L", maxSess)
+    wasIn := inS
+
 // Label d'un niveau de période, toujours recréé sur la dernière barre
 f_periodLabel(string txt, float price, bool show) =>
     var label lb = na
@@ -134,6 +196,17 @@ f_periodLabel(string txt, float price, bool show) =>
         label.delete(lb)
         if show and not na(price)
             lb := label.new(bar_index + labelOffset, price, txt, color=color(na), style=label.style_label_left, textcolor=colPeriod, size=lblSize)
+
+// ----------------------------------------------------------------------------
+// SESSIONS : création des niveaux (avant le test de sweep, pour que la première
+// bougie après la session puisse déjà les balayer)
+// ----------------------------------------------------------------------------
+f_session("Asia", asiaSess, showAsia, colAsia)
+f_session("London", londonSess, showLondon, colLondon)
+f_session("NY", nySess, showNY, colNY)
+
+bool sessHighNow = f_sweep(sessHighs, true)
+bool sessLowNow  = f_sweep(sessLows, false)
 
 // ----------------------------------------------------------------------------
 // SWINGS : détection, EQH/EQL, sweeps
@@ -157,8 +230,8 @@ if showSwings
                     if not l.isEq
                         l.isEq := true
                         f_paint(l)
-        array.push(highs, f_new(ph, true, eq))
-        f_trim(highs)
+        array.push(highs, f_new(ph, true, eq, bar_index - swingLen, "", color(na)))
+        f_trim(highs, maxLevels)
 
     if not na(pl)
         bool eq = false
@@ -169,8 +242,8 @@ if showSwings
                     if not l.isEq
                         l.isEq := true
                         f_paint(l)
-        array.push(lows, f_new(pl, false, eq))
-        f_trim(lows)
+        array.push(lows, f_new(pl, false, eq, bar_index - swingLen, "", color(na)))
+        f_trim(lows, maxLevels)
 
 // Les labels des niveaux actifs suivent le bord droit du graphique
 if barstate.islast
@@ -178,12 +251,18 @@ if barstate.islast
         label.set_x(l.lb, bar_index + labelOffset)
     for l in lows
         label.set_x(l.lb, bar_index + labelOffset)
+    for l in sessHighs
+        label.set_x(l.lb, bar_index + labelOffset)
+    for l in sessLows
+        label.set_x(l.lb, bar_index + labelOffset)
 
-plotshape(showMarks and sweptHighNow, "Sweep BSL", style=shape.xcross, location=location.abovebar, color=colBSL, size=size.tiny)
-plotshape(showMarks and sweptLowNow,  "Sweep SSL", style=shape.xcross, location=location.belowbar, color=colSSL, size=size.tiny)
+plotshape(showMarks and (sweptHighNow or sessHighNow), "Sweep haut", style=shape.xcross, location=location.abovebar, color=colBSL, size=size.tiny)
+plotshape(showMarks and (sweptLowNow or sessLowNow),   "Sweep bas",  style=shape.xcross, location=location.belowbar, color=colSSL, size=size.tiny)
 
 alertcondition(sweptHighNow, "Sweep BSL / EQH", "Liquidité haute (BSL/EQH) balayée sur {{ticker}} ({{interval}})")
 alertcondition(sweptLowNow,  "Sweep SSL / EQL", "Liquidité basse (SSL/EQL) balayée sur {{ticker}} ({{interval}})")
+alertcondition(sessHighNow,  "Sweep High de session", "High de session (Asia/London/NY) balayé sur {{ticker}} ({{interval}})")
+alertcondition(sessLowNow,   "Sweep Low de session",  "Low de session (Asia/London/NY) balayé sur {{ticker}} ({{interval}})")
 
 // ----------------------------------------------------------------------------
 // NIVEAUX DE PÉRIODES PRÉCÉDENTES (sans repaint : valeur [1] + lookahead_on)
