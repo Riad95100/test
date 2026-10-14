@@ -1,0 +1,216 @@
+//@version=5
+// Liquidity Levels — BSL/SSL (swings), EQH/EQL, PDH/PDL, PWH/PWL, PMH/PML
+// Fonctionne sur n'importe quel symbole / timeframe (forex, indices, or, crypto, actions...).
+// Usage éducatif uniquement, aucune garantie de performance.
+//
+// Concepts :
+//   BSL  = Buy-Side Liquidity  : stops au-dessus d'un plus haut (swing high)
+//   SSL  = Sell-Side Liquidity : stops en dessous d'un plus bas (swing low)
+//   EQH / EQL = Equal Highs / Equal Lows (plusieurs extrêmes au même niveau = liquidité plus dense)
+//   PDH/PDL, PWH/PWL, PMH/PML = plus haut / plus bas du jour, de la semaine, du mois précédents
+//   Un niveau est "balayé" (swept) quand le prix le dépasse : la ligne s'arrête et passe en gris.
+indicator("Liquidity Levels (BSL/SSL, EQH/EQL, PDH/PDL)", shorttitle="Liquidity", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ----------------------------------------------------------------------------
+// INPUTS
+// ----------------------------------------------------------------------------
+grpSwing = "Swings (BSL / SSL)"
+showSwings = input.bool(true, "Afficher les swings BSL / SSL", group=grpSwing)
+swingLen   = input.int(5, "Longueur du pivot (barres de chaque côté)", minval=1, maxval=50, group=grpSwing)
+maxLevels  = input.int(8, "Niveaux actifs max par côté", minval=1, maxval=50, group=grpSwing)
+
+grpEq = "Equal Highs / Equal Lows"
+showEq = input.bool(true, "Détecter EQH / EQL", group=grpEq)
+eqTol  = input.float(0.15, "Tolérance (x ATR)", minval=0.0, step=0.05, group=grpEq)
+atrLen = input.int(14, "Longueur ATR", minval=1, group=grpEq)
+
+grpSweep = "Sweep (niveau balayé)"
+sweepMode  = input.string("Mèche (sweep)", "Détection", options=["Mèche (sweep)", "Clôture (break)"], group=grpSweep)
+showSwept  = input.bool(true, "Garder les niveaux balayés (grisés)", group=grpSweep)
+maxSwept   = input.int(10, "Niveaux balayés max affichés", minval=1, maxval=100, group=grpSweep)
+showMarks  = input.bool(true, "Marqueur ✕ sur la bougie du sweep", group=grpSweep)
+
+grpPeriod = "Niveaux de périodes précédentes"
+showPD = input.bool(true, "Jour précédent (PDH / PDL)", group=grpPeriod)
+showPW = input.bool(true, "Semaine précédente (PWH / PWL)", group=grpPeriod)
+showPM = input.bool(true, "Mois précédent (PMH / PML)", group=grpPeriod)
+
+grpStyle = "Style"
+colBSL     = input.color(#F23645, "Couleur BSL / EQH", group=grpStyle)
+colSSL     = input.color(#089981, "Couleur SSL / EQL", group=grpStyle)
+colPeriod  = input.color(#FFB300, "Couleur PDH/PDL/PWH/PWL/PMH/PML", group=grpStyle)
+colSwept   = input.color(color.new(color.gray, 30), "Couleur niveau balayé", group=grpStyle)
+lineStyle  = input.string("Tirets", "Style de ligne", options=["Tirets", "Pointillé", "Continu"], group=grpStyle)
+lineWidth  = input.int(1, "Épaisseur", minval=1, maxval=4, group=grpStyle)
+lblSize    = input.string(size.small, "Taille des labels", options=[size.tiny, size.small, size.normal], group=grpStyle)
+labelOffset = input.int(3, "Décalage des labels à droite (barres)", minval=0, maxval=50, group=grpStyle)
+
+// ----------------------------------------------------------------------------
+// TYPES / ÉTAT
+// ----------------------------------------------------------------------------
+type Liq
+    float price
+    bool  isHigh
+    bool  isEq
+    line  ln
+    label lb
+
+var array<Liq> highs = array.new<Liq>()   // BSL / EQH actifs
+var array<Liq> lows  = array.new<Liq>()   // SSL / EQL actifs
+var array<Liq> done  = array.new<Liq>()   // niveaux balayés conservés à l'écran
+
+bool sweepOnClose = sweepMode == "Clôture (break)"
+float srcHi = sweepOnClose ? close : high
+float srcLo = sweepOnClose ? close : low
+float atrV  = ta.atr(atrLen)
+
+// ----------------------------------------------------------------------------
+// FONCTIONS
+// ----------------------------------------------------------------------------
+f_lineStyle(string s) =>
+    s == "Pointillé" ? line.style_dotted : s == "Tirets" ? line.style_dashed : line.style_solid
+
+f_name(Liq l) =>
+    l.isHigh ? (l.isEq ? "EQH" : "BSL") : (l.isEq ? "EQL" : "SSL")
+
+f_paint(Liq l) =>
+    color c = l.isHigh ? colBSL : colSSL
+    line.set_color(l.ln, c)
+    line.set_width(l.ln, l.isEq ? lineWidth + 1 : lineWidth)
+    line.set_style(l.ln, f_lineStyle(lineStyle))
+    label.set_text(l.lb, f_name(l))
+    label.set_textcolor(l.lb, c)
+
+f_new(float price, bool isHigh, bool isEq) =>
+    line ln = line.new(bar_index - swingLen, price, bar_index, price, extend=extend.right)
+    label lb = label.new(bar_index, price, "", color=color(na), style=label.style_label_left, size=lblSize)
+    Liq l = Liq.new(price, isHigh, isEq, ln, lb)
+    f_paint(l)
+    l
+
+f_trim(array<Liq> arr) =>
+    while array.size(arr) > maxLevels
+        Liq o = array.shift(arr)
+        line.delete(o.ln)
+        label.delete(o.lb)
+
+f_retire(Liq l) =>
+    if showSwept
+        line.set_extend(l.ln, extend.none)
+        line.set_x2(l.ln, bar_index)
+        line.set_color(l.ln, colSwept)
+        line.set_style(l.ln, line.style_dotted)
+        line.set_width(l.ln, 1)
+        label.set_x(l.lb, bar_index)
+        label.set_text(l.lb, f_name(l) + " ✕")
+        label.set_textcolor(l.lb, colSwept)
+        array.push(done, l)
+        if array.size(done) > maxSwept
+            Liq o = array.shift(done)
+            line.delete(o.ln)
+            label.delete(o.lb)
+    else
+        line.delete(l.ln)
+        label.delete(l.lb)
+
+// Parcourt les niveaux actifs, retire ceux qui viennent d'être balayés. Retourne true si au moins un.
+f_sweep(array<Liq> arr, bool isHigh) =>
+    bool hit = false
+    int i = array.size(arr) - 1
+    while i >= 0
+        Liq l = array.get(arr, i)
+        bool crossed = isHigh ? srcHi > l.price : srcLo < l.price
+        if crossed
+            hit := true
+            array.remove(arr, i)
+            f_retire(l)
+        i -= 1
+    hit
+
+// Label d'un niveau de période, toujours recréé sur la dernière barre
+f_periodLabel(string txt, float price, bool show) =>
+    var label lb = na
+    if barstate.islast
+        label.delete(lb)
+        if show and not na(price)
+            lb := label.new(bar_index + labelOffset, price, txt, color=color(na), style=label.style_label_left, textcolor=colPeriod, size=lblSize)
+
+// ----------------------------------------------------------------------------
+// SWINGS : détection, EQH/EQL, sweeps
+// ----------------------------------------------------------------------------
+float ph = ta.pivothigh(high, swingLen, swingLen)
+float pl = ta.pivotlow(low, swingLen, swingLen)
+
+bool sweptHighNow = false
+bool sweptLowNow  = false
+
+if showSwings
+    sweptHighNow := f_sweep(highs, true)
+    sweptLowNow  := f_sweep(lows, false)
+
+    if not na(ph)
+        bool eq = false
+        if showEq
+            for l in highs
+                if math.abs(l.price - ph) <= eqTol * atrV
+                    eq := true
+                    if not l.isEq
+                        l.isEq := true
+                        f_paint(l)
+        array.push(highs, f_new(ph, true, eq))
+        f_trim(highs)
+
+    if not na(pl)
+        bool eq = false
+        if showEq
+            for l in lows
+                if math.abs(l.price - pl) <= eqTol * atrV
+                    eq := true
+                    if not l.isEq
+                        l.isEq := true
+                        f_paint(l)
+        array.push(lows, f_new(pl, false, eq))
+        f_trim(lows)
+
+// Les labels des niveaux actifs suivent le bord droit du graphique
+if barstate.islast
+    for l in highs
+        label.set_x(l.lb, bar_index + labelOffset)
+    for l in lows
+        label.set_x(l.lb, bar_index + labelOffset)
+
+plotshape(showMarks and sweptHighNow, "Sweep BSL", style=shape.xcross, location=location.abovebar, color=colBSL, size=size.tiny)
+plotshape(showMarks and sweptLowNow,  "Sweep SSL", style=shape.xcross, location=location.belowbar, color=colSSL, size=size.tiny)
+
+alertcondition(sweptHighNow, "Sweep BSL / EQH", "Liquidité haute (BSL/EQH) balayée sur {{ticker}} ({{interval}})")
+alertcondition(sweptLowNow,  "Sweep SSL / EQL", "Liquidité basse (SSL/EQL) balayée sur {{ticker}} ({{interval}})")
+
+// ----------------------------------------------------------------------------
+// NIVEAUX DE PÉRIODES PRÉCÉDENTES (sans repaint : valeur [1] + lookahead_on)
+// ----------------------------------------------------------------------------
+[pdH, pdL] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead=barmerge.lookahead_on)
+[pwH, pwL] = request.security(syminfo.tickerid, "W", [high[1], low[1]], lookahead=barmerge.lookahead_on)
+[pmH, pmL] = request.security(syminfo.tickerid, "M", [high[1], low[1]], lookahead=barmerge.lookahead_on)
+
+chartSec = timeframe.in_seconds()
+okD = showPD and chartSec < timeframe.in_seconds("D")
+okW = showPW and chartSec < timeframe.in_seconds("W")
+okM = showPM and chartSec < timeframe.in_seconds("M")
+
+newD = timeframe.change("D")
+newW = timeframe.change("W")
+newM = timeframe.change("M")
+
+plot(okD and not newD ? pdH : na, "PDH", color=colPeriod, linewidth=lineWidth, style=plot.style_linebr)
+plot(okD and not newD ? pdL : na, "PDL", color=colPeriod, linewidth=lineWidth, style=plot.style_linebr)
+plot(okW and not newW ? pwH : na, "PWH", color=colPeriod, linewidth=lineWidth, style=plot.style_linebr)
+plot(okW and not newW ? pwL : na, "PWL", color=colPeriod, linewidth=lineWidth, style=plot.style_linebr)
+plot(okM and not newM ? pmH : na, "PMH", color=colPeriod, linewidth=lineWidth, style=plot.style_linebr)
+plot(okM and not newM ? pmL : na, "PML", color=colPeriod, linewidth=lineWidth, style=plot.style_linebr)
+
+f_periodLabel("PDH", pdH, okD)
+f_periodLabel("PDL", pdL, okD)
+f_periodLabel("PWH", pwH, okW)
+f_periodLabel("PWL", pwL, okW)
+f_periodLabel("PMH", pmH, okM)
+f_periodLabel("PML", pmL, okM)
