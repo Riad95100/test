@@ -22,6 +22,8 @@ def main() -> int:
     ap.add_argument("--csv", help="Fichier CSV de bougies M5")
     ap.add_argument("--symbol", default="XAUUSD", help="Profil d'instrument (clé de la config) : XAUUSD, US30...")
     ap.add_argument("--config", help="Fichier JSON de configuration (voir config.example.json)")
+    ap.add_argument("--m15-csv", help="CSV M15 (optionnel, historique plus long que le M5 pour l'ADX)")
+    ap.add_argument("--h1-csv", help="CSV H1 (optionnel, historique plus long que le M5 pour le biais EMA50/200)")
     ap.add_argument("--data-tz", help="Fuseau horaire des timestamps du CSV (défaut: config.data_tz = UTC)")
     ap.add_argument("--from", dest="start", help="Date de début (YYYY-MM-DD)")
     ap.add_argument("--to", dest="end", help="Date de fin (YYYY-MM-DD)")
@@ -48,7 +50,10 @@ def main() -> int:
         ap.error("--csv ou --demo requis")
 
     print(f"{a.symbol}: {len(m5)} bougies M5 de {m5.index[0]} à {m5.index[-1]}")
-    res = run_backtest(m5, cfg, inst, start=a.start, end=a.end)
+    tz = a.data_tz or cfg.data_tz
+    m15 = load_csv(a.m15_csv, tz=tz) if a.m15_csv else None
+    h1 = load_csv(a.h1_csv, tz=tz) if a.h1_csv else None
+    res = run_backtest(m5, cfg, inst, start=a.start or str(m5.index[0].date()), end=a.end, m15=m15, h1=h1)
     print(res.summary())
     if a.save_trades and not res.trades.empty:
         Path(a.save_trades).parent.mkdir(parents=True, exist_ok=True)

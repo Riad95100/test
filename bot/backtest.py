@@ -32,9 +32,10 @@ class BacktestResult:
 
 
 def run_backtest(m5: pd.DataFrame, cfg: BotConfig, inst: Instrument, start: str | None = None,
-                 end: str | None = None) -> BacktestResult:
+                 end: str | None = None, m15: pd.DataFrame | None = None, h1: pd.DataFrame | None = None) -> BacktestResult:
+    """`m15` / `h1` : séries fournies (ex. historique plus profond que le M5 disponible) ; sinon dérivées du M5."""
     p, r = cfg.strategy, cfg.risk
-    sig = compute_signals(m5, p)  # calculé sur TOUT l'historique (chauffe des indicateurs), puis filtré
+    sig = compute_signals(m5, p, m15, h1)  # calculé sur TOUT l'historique (chauffe des indicateurs), puis filtré
     if start or end:
         sig = sig.loc[start:end]
     sched = Schedule(r)
