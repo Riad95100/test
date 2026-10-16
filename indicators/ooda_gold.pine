@@ -1,0 +1,295 @@
+//@version=5
+// =============================================================================
+// OODA GOLD — Signaux BUY / SELL avec 1 Stop Loss + 2 Take Profits (XAUUSD)
+// =============================================================================
+// Boucle OODA (Observe → Orient → Decide → Act), exécutée à la clôture de
+// chaque bougie (aucun repaint : signaux uniquement sur bougie confirmée,
+// biais HTF lu sur la bougie HTF *précédente* clôturée).
+//
+//   OBSERVER  : prix, EMA HTF 50/200, EMA locales 21/50, ADX/DMI, RSI, MACD,
+//               VWAP, ATR, structure (pivots), session.
+//   ORIENTER  : score de contexte 0-100 pour l'achat et pour la vente
+//               (tendance HTF 25 + tendance locale 15 + force ADX 15 +
+//               RSI 10 + MACD 10 + VWAP 10 + structure 15) + filtres
+//               session / volatilité.
+//   DECIDER   : signal seulement si (1) biais HTF dans le même sens,
+//               (2) score >= seuil, (3) pullback sur EMA21 puis reprise
+//               (bougie de rejet / cassure du plus haut-bas précédent),
+//               (4) prix pas sur-étendu, (5) risque (SL) raisonnable,
+//               (6) aucun trade déjà actif + cooldown.
+//   AGIR      : entrée = clôture de la bougie signal.
+//               SL  = swing récent -/+ buffer ATR (borné entre min et max ATR).
+//               TP1 = RR 1:1 (50 % de la position) → SL remonté à break-even.
+//               TP2 = RR 1:2 (50 % restants).
+//
+// Le tableau de bord intègre un backtest interne (winrate, R total, profit
+// factor) calculé sur l'historique chargé, pour juger la stratégie AVANT de
+// l'utiliser. Hypothèse prudente : si SL et TP sont touchés dans la même
+// bougie, le SL est compté en premier.
+//
+// ⚠️ Aucun indicateur n'est "infaillible". Usage éducatif. Testez en démo,
+// évitez les annonces à fort impact (NFP, CPI, FOMC), risquez <= 1 % / trade.
+// =============================================================================
+indicator("OODA Gold — Buy/Sell + SL + 2 TP", shorttitle="OODA Gold", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ----------------------------------------------------------------------------
+// INPUTS
+// ----------------------------------------------------------------------------
+g1 = "1. OBSERVER — Données"
+htfTf       = input.timeframe("60", "Timeframe du biais (HTF)", group=g1)
+htfFastLen  = input.int(50,  "EMA rapide HTF",   minval=1, group=g1)
+htfSlowLen  = input.int(200, "EMA lente HTF",    minval=1, group=g1)
+emaLen      = input.int(21,  "EMA pullback (locale)", minval=1, group=g1)
+emaTrendLen = input.int(50,  "EMA tendance locale",   minval=1, group=g1)
+adxLen      = input.int(14,  "Longueur ADX/DMI", minval=1, group=g1)
+rsiLen      = input.int(14,  "Longueur RSI",      minval=1, group=g1)
+atrLen      = input.int(14,  "Longueur ATR",      minval=1, group=g1)
+pivotLen    = input.int(3,   "Pivots structure (barres de chaque côté)", minval=1, group=g1)
+
+g2 = "2. ORIENTER — Contexte"
+minScore   = input.int(70, "Score minimum (0-100)", minval=40, maxval=100, group=g2)
+adxMin     = input.float(20.0, "ADX minimum", minval=0, group=g2)
+useSession = input.bool(true, "Filtrer par session", group=g2)
+sessionStr = input.session("0700-2000", "Session autorisée (UTC) — Londres + New York", group=g2)
+volMin     = input.float(0.6, "Volatilité min (ATR / moyenne ATR)", minval=0.1, step=0.1, group=g2)
+volMax     = input.float(2.5, "Volatilité max (évite pics d'annonces)", minval=1.0, step=0.1, group=g2)
+
+g3 = "3. DÉCIDER — Déclencheur"
+maxExtATR = input.float(1.5, "Écart max prix / EMA21 (x ATR)", minval=0.5, step=0.1, group=g3)
+cooldown  = input.int(5, "Cooldown après clôture d'un trade (barres)", minval=0, group=g3)
+
+g4 = "4. AGIR — SL / TP"
+slLookback = input.int(10, "Lookback swing pour le SL (barres)", minval=3, group=g4)
+slBuffer   = input.float(0.3, "Buffer SL au-delà du swing (x ATR)", minval=0.0, step=0.1, group=g4)
+slMinATR   = input.float(1.0, "Distance SL minimale (x ATR)", minval=0.1, step=0.1, group=g4)
+slMaxATR   = input.float(2.5, "Distance SL maximale (x ATR) — sinon pas de trade", minval=0.5, step=0.1, group=g4)
+rr1        = input.float(1.0, "TP1 — ratio R:R", minval=0.1, step=0.1, group=g4)
+rr2        = input.float(2.0, "TP2 — ratio R:R", minval=0.2, step=0.1, group=g4)
+tp1Pct     = input.int(50, "% de la position clôturée au TP1", minval=10, maxval=90, group=g4)
+moveBE     = input.bool(true, "SL à break-even après TP1", group=g4)
+
+g5 = "Affichage"
+showEmas  = input.bool(true, "Afficher EMA 21 / 50 / VWAP", group=g5)
+showTable = input.bool(true, "Afficher le tableau de bord", group=g5)
+
+// ----------------------------------------------------------------------------
+// 1) OBSERVER
+// ----------------------------------------------------------------------------
+// HTF sans repaint : valeur de la bougie HTF précédente (déjà clôturée).
+htfFast  = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfFastLen)[1], lookahead=barmerge.lookahead_on)
+htfSlow  = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfSlowLen)[1], lookahead=barmerge.lookahead_on)
+htfClose = request.security(syminfo.tickerid, htfTf, close[1], lookahead=barmerge.lookahead_on)
+
+ema21    = ta.ema(close, emaLen)
+emaTrend = ta.ema(close, emaTrendLen)
+vwapV    = ta.vwap(hlc3)
+atr      = ta.atr(atrLen)
+atrAvg   = ta.sma(atr, 100)
+volRatio = atrAvg > 0 ? atr / atrAvg : 1.0
+rsi      = ta.rsi(close, rsiLen)
+[diP, diM, adx] = ta.dmi(adxLen, adxLen)
+[macdL, macdS, macdH] = ta.macd(close, 12, 26, 9)
+
+// Structure : deux derniers pivots hauts / bas confirmés
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+var float ph1 = na
+var float ph2 = na
+var float pl1 = na
+var float pl2 = na
+if not na(ph)
+    ph2 := ph1
+    ph1 := ph
+if not na(pl)
+    pl2 := pl1
+    pl1 := pl
+higherLows = pl1 > pl2
+lowerHighs = ph1 < ph2
+
+// ----------------------------------------------------------------------------
+// 2) ORIENTER — score de contexte
+// ----------------------------------------------------------------------------
+htfBull = htfFast > htfSlow and htfClose > htfFast
+htfBear = htfFast < htfSlow and htfClose < htfFast
+locBull = close > emaTrend and ema21 > emaTrend
+locBear = close < emaTrend and ema21 < emaTrend
+adxOk   = adx > adxMin
+vwapBull = not na(vwapV) and close > vwapV
+vwapBear = not na(vwapV) and close < vwapV
+
+bullScore = (htfBull ? 25 : 0) + (locBull ? 15 : 0) + (adxOk and diP > diM ? 15 : 0) + (rsi > 50 and rsi < 70 ? 10 : 0) + (macdH > 0 and macdH > macdH[1] ? 10 : 0) + (vwapBull ? 10 : 0) + (higherLows ? 15 : 0)
+bearScore = (htfBear ? 25 : 0) + (locBear ? 15 : 0) + (adxOk and diM > diP ? 15 : 0) + (rsi < 50 and rsi > 30 ? 10 : 0) + (macdH < 0 and macdH < macdH[1] ? 10 : 0) + (vwapBear ? 10 : 0) + (lowerHighs ? 15 : 0)
+
+inSession = not useSession or not na(time(timeframe.period, sessionStr, "UTC"))
+volOk     = volRatio >= volMin and volRatio <= volMax
+
+// ----------------------------------------------------------------------------
+// 3) DÉCIDER — déclencheur pullback + reprise
+// ----------------------------------------------------------------------------
+body      = math.abs(close - open)
+lowerWick = math.min(open, close) - low
+upperWick = high - math.max(open, close)
+
+touchedLong  = ta.lowest(low, 3) <= ema21
+touchedShort = ta.highest(high, 3) >= ema21
+trigLong  = touchedLong  and close > ema21 and close > open and (close > high[1] or lowerWick >= body * 1.5)
+trigShort = touchedShort and close < ema21 and close < open and (close < low[1]  or upperWick >= body * 1.5)
+
+notExtLong  = (close - ema21) <= atr * maxExtATR
+notExtShort = (ema21 - close) <= atr * maxExtATR
+
+// Niveaux de risque (SL structurel borné par l'ATR)
+swLow  = ta.lowest(low, slLookback)
+swHigh = ta.highest(high, slLookback)
+riskLong  = math.max(close - (swLow - atr * slBuffer), atr * slMinATR)
+riskShort = math.max((swHigh + atr * slBuffer) - close, atr * slMinATR)
+riskOkLong  = riskLong  <= atr * slMaxATR
+riskOkShort = riskShort <= atr * slMaxATR
+
+// ----------------------------------------------------------------------------
+// 4) AGIR — état du trade, gestion, statistiques
+// ----------------------------------------------------------------------------
+var int   tradeDir = 0      // 0 = aucun, 1 = long, -1 = short
+var int   stage = 0         // 0 = avant TP1, 1 = après TP1
+var int   entryBar = 0
+var int   lastCloseBar = -1000
+var float eP = na
+var float slP = na
+var float tp1P = na
+var float tp2P = na
+var line  lnE = na
+var line  lnSL = na
+var line  lnT1 = na
+var line  lnT2 = na
+
+var int   trades = 0
+var int   wins = 0
+var float totalR = 0.0
+var float grossWin = 0.0
+var float grossLoss = 0.0
+
+share = tp1Pct / 100.0
+bool evTP1 = false
+bool evTP2 = false
+bool evSL  = false
+bool evBE  = false
+
+// --- Gestion du trade actif (sur bougie confirmée) ---
+if barstate.isconfirmed and tradeDir != 0 and bar_index > entryBar
+    line.set_x2(lnE,  bar_index)
+    line.set_x2(lnSL, bar_index)
+    line.set_x2(lnT1, bar_index)
+    line.set_x2(lnT2, bar_index)
+
+    bool slHit  = tradeDir == 1 ? low <= slP  : high >= slP
+    bool tp1Hit = tradeDir == 1 ? high >= tp1P : low <= tp1P
+    bool tp2Hit = tradeDir == 1 ? high >= tp2P : low <= tp2P
+    float rRes = na
+
+    if stage == 0
+        if slHit
+            rRes := -1.0
+            evSL := true
+        else if tp1Hit
+            stage := 1
+            evTP1 := true
+            label.new(bar_index, tp1P, "TP1 ✔", style=label.style_label_left, color=color.new(color.teal, 20), textcolor=color.white, size=size.tiny)
+            if moveBE
+                slP := eP
+                line.set_y1(lnSL, eP)
+                line.set_y2(lnSL, eP)
+    else
+        if slHit
+            rRes := moveBE ? share * rr1 : share * rr1 - (1.0 - share)
+            evBE := moveBE
+            evSL := not moveBE
+        else if tp2Hit
+            rRes := share * rr1 + (1.0 - share) * rr2
+            evTP2 := true
+
+    if not na(rRes)
+        trades += 1
+        totalR += rRes
+        if rRes > 0
+            wins += 1
+            grossWin += rRes
+        else
+            grossLoss += -rRes
+        string resTxt = (evTP2 ? "TP2 ✔✔  " : evBE ? "BE  " : "SL ✘  ") + (rRes >= 0 ? "+" : "") + str.tostring(rRes, "#.##") + "R"
+        color resCol = rRes > 0 ? color.new(color.green, 10) : color.new(color.red, 10)
+        label.new(bar_index, tradeDir == 1 ? high : low, resTxt, style=tradeDir == 1 ? label.style_label_down : label.style_label_up, color=resCol, textcolor=color.white, size=size.tiny)
+        tradeDir := 0
+        stage := 0
+        lastCloseBar := bar_index
+
+// --- Signal d'entrée ---
+canEnter = barstate.isconfirmed and tradeDir == 0 and (bar_index - lastCloseBar > cooldown) and inSession and volOk and not na(htfSlow) and not na(atr)
+buySig  = canEnter and htfBull and bullScore >= minScore and trigLong  and notExtLong  and riskOkLong
+sellSig = canEnter and htfBear and bearScore >= minScore and trigShort and notExtShort and riskOkShort
+
+if buySig or sellSig
+    int   d    = buySig ? 1 : -1
+    float risk = buySig ? riskLong : riskShort
+    int   scr  = buySig ? bullScore : bearScore
+    tradeDir := d
+    stage := 0
+    entryBar := bar_index
+    eP   := close
+    slP  := close - d * risk
+    tp1P := close + d * risk * rr1
+    tp2P := close + d * risk * rr2
+
+    lnE  := line.new(bar_index, eP,   bar_index + 1, eP,   color=color.new(color.gray, 0), style=line.style_dashed, width=1)
+    lnSL := line.new(bar_index, slP,  bar_index + 1, slP,  color=color.red,   style=line.style_solid, width=2)
+    lnT1 := line.new(bar_index, tp1P, bar_index + 1, tp1P, color=color.teal,  style=line.style_solid, width=1)
+    lnT2 := line.new(bar_index, tp2P, bar_index + 1, tp2P, color=color.green, style=line.style_solid, width=2)
+
+    string sigTxt = (d == 1 ? "BUY" : "SELL") + "  (score " + str.tostring(scr) + ")" + "\nEntrée " + str.tostring(eP, format.mintick) + "\nSL  " + str.tostring(slP, format.mintick) + "\nTP1 " + str.tostring(tp1P, format.mintick) + "\nTP2 " + str.tostring(tp2P, format.mintick)
+    label.new(bar_index, d == 1 ? low : high, sigTxt, style=d == 1 ? label.style_label_up : label.style_label_down, color=d == 1 ? color.new(color.green, 0) : color.new(color.red, 0), textcolor=color.white, size=size.small)
+
+// ----------------------------------------------------------------------------
+// AFFICHAGE
+// ----------------------------------------------------------------------------
+plot(showEmas ? ema21 : na,    "EMA 21", color=color.new(color.orange, 0), linewidth=1)
+plot(showEmas ? emaTrend : na, "EMA 50", color=color.new(color.blue, 0),   linewidth=1)
+plot(showEmas ? vwapV : na,    "VWAP",   color=color.new(color.purple, 40), linewidth=1)
+
+bgcolor(htfBull ? color.new(color.green, 94) : htfBear ? color.new(color.red, 94) : na, title="Biais HTF")
+
+// ----------------------------------------------------------------------------
+// TABLEAU DE BORD
+// ----------------------------------------------------------------------------
+var table tbl = table.new(position.top_right, 2, 11, border_width=1, frame_color=color.gray, frame_width=1)
+
+f_cell(row, lbl, val, valCol) =>
+    table.cell(tbl, 0, row, lbl, text_color=color.white, bgcolor=color.new(color.gray, 20), text_size=size.small, text_halign=text.align_left)
+    table.cell(tbl, 1, row, val, text_color=color.white, bgcolor=valCol, text_size=size.small, text_halign=text.align_right)
+
+if showTable and barstate.islast
+    biasTxt = htfBull ? "Haussier" : htfBear ? "Baissier" : "Neutre"
+    biasCol = htfBull ? color.new(color.green, 20) : htfBear ? color.new(color.red, 20) : color.new(color.gray, 30)
+    stateTxt = tradeDir == 1 ? "LONG actif" : tradeDir == -1 ? "SHORT actif" : "En attente"
+    stateCol = tradeDir == 1 ? color.new(color.green, 20) : tradeDir == -1 ? color.new(color.red, 20) : color.new(color.gray, 30)
+    wr = trades > 0 ? wins * 100.0 / trades : na
+    pf = grossLoss > 0 ? grossWin / grossLoss : na
+    table.cell(tbl, 0, 0, "OODA GOLD", text_color=color.white, bgcolor=color.new(color.orange, 10), text_size=size.small, text_halign=text.align_left)
+    table.cell(tbl, 1, 0, syminfo.ticker + " " + timeframe.period, text_color=color.white, bgcolor=color.new(color.orange, 10), text_size=size.small, text_halign=text.align_right)
+    f_cell(1, "Biais HTF", biasTxt, biasCol)
+    f_cell(2, "Score ▲ / ▼", str.tostring(bullScore) + " / " + str.tostring(bearScore), color.new(color.gray, 30))
+    f_cell(3, "ADX", str.tostring(adx, "#.0") + (adxOk ? " ✔" : " ✘"), adxOk ? color.new(color.green, 30) : color.new(color.red, 30))
+    f_cell(4, "Volatilité (x moy.)", str.tostring(volRatio, "#.00") + (volOk ? " ✔" : " ✘"), volOk ? color.new(color.green, 30) : color.new(color.red, 30))
+    f_cell(5, "Session", inSession ? "Active ✔" : "Hors session ✘", inSession ? color.new(color.green, 30) : color.new(color.red, 30))
+    f_cell(6, "État", stateTxt, stateCol)
+    f_cell(7, "Trades (historique)", str.tostring(trades), color.new(color.gray, 30))
+    f_cell(8, "Winrate (R>0)", na(wr) ? "—" : str.tostring(wr, "#.0") + " %", color.new(color.gray, 30))
+    f_cell(9, "R total", (totalR >= 0 ? "+" : "") + str.tostring(totalR, "#.##") + " R", totalR >= 0 ? color.new(color.green, 30) : color.new(color.red, 30))
+    f_cell(10, "Profit factor", na(pf) ? "—" : str.tostring(pf, "#.##"), color.new(color.gray, 30))
+
+// ----------------------------------------------------------------------------
+// ALERTES
+// ----------------------------------------------------------------------------
+alertcondition(buySig,  "OODA Gold — BUY",  "OODA Gold BUY {{ticker}} @ {{close}} (voir SL/TP1/TP2 sur le graphique)")
+alertcondition(sellSig, "OODA Gold — SELL", "OODA Gold SELL {{ticker}} @ {{close}} (voir SL/TP1/TP2 sur le graphique)")
+alertcondition(evTP1,   "OODA Gold — TP1 atteint", "OODA Gold {{ticker}} : TP1 atteint")
+alertcondition(evTP2,   "OODA Gold — TP2 atteint", "OODA Gold {{ticker}} : TP2 atteint")
+alertcondition(evSL or evBE, "OODA Gold — SL / BE touché", "OODA Gold {{ticker}} : SL ou break-even touché")
