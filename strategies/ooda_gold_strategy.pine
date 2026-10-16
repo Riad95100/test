@@ -1,0 +1,204 @@
+//@version=5
+// =============================================================================
+// OODA GOLD — VERSION BACKTESTABLE (strategy) — XAUUSD
+// =============================================================================
+// Même logique OODA que indicators/ooda_gold.pine (Observer → Orienter →
+// Décider → Agir), exécutée dans le Strategy Tester de TradingView :
+//   - 1 Stop Loss structurel (swing ± buffer ATR, borné min/max ATR)
+//   - TP1 (50 % par défaut) à 1R, puis SL remonté à break-even
+//   - TP2 (le reste) à 2R
+//   - sizing basé sur le risque (% du capital par trade)
+//   - filtre de session, volatilité, plage de dates, max trades par jour
+//
+// ⚠️ Un backtest n'est pas une preuve de rentabilité future. Les résultats
+// dépendent du spread, du slippage, des commissions et de la qualité des
+// données de votre broker. Si SL et TP sont atteints dans la même bougie,
+// c'est l'émulateur de TradingView qui décide de l'ordre (hypothèse OHLC).
+// Réglez commission/slippage dans les propriétés de la stratégie pour votre
+// broker. Testez en démo avant tout capital réel.
+// =============================================================================
+strategy("OODA Gold — Strategy (Buy/Sell + SL + 2 TP)", shorttitle="OODA Gold Strat", overlay=true,
+     initial_capital=10000, currency=currency.USD,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract, commission_value=0.0,
+     slippage=2, calc_on_every_tick=false, process_orders_on_close=true,
+     max_labels_count=500)
+
+// ----------------------------------------------------------------------------
+// INPUTS
+// ----------------------------------------------------------------------------
+g1 = "1. OBSERVER — Données"
+htfTf       = input.timeframe("60", "Timeframe du biais (HTF)", group=g1)
+htfFastLen  = input.int(50,  "EMA rapide HTF",   minval=1, group=g1)
+htfSlowLen  = input.int(200, "EMA lente HTF",    minval=1, group=g1)
+emaLen      = input.int(21,  "EMA pullback (locale)", minval=1, group=g1)
+emaTrendLen = input.int(50,  "EMA tendance locale",   minval=1, group=g1)
+adxLen      = input.int(14,  "Longueur ADX/DMI", minval=1, group=g1)
+rsiLen      = input.int(14,  "Longueur RSI",      minval=1, group=g1)
+atrLen      = input.int(14,  "Longueur ATR",      minval=1, group=g1)
+pivotLen    = input.int(3,   "Pivots structure (barres de chaque côté)", minval=1, group=g1)
+
+g2 = "2. ORIENTER — Contexte"
+minScore   = input.int(70, "Score minimum (0-100)", minval=40, maxval=100, group=g2)
+adxMin     = input.float(20.0, "ADX minimum", minval=0, group=g2)
+useSession = input.bool(true, "Filtrer par session", group=g2)
+sessionStr = input.session("0700-2000", "Session autorisée (UTC)", group=g2)
+volMin     = input.float(0.6, "Volatilité min (ATR / moyenne ATR)", minval=0.1, step=0.1, group=g2)
+volMax     = input.float(2.5, "Volatilité max (évite pics d'annonces)", minval=1.0, step=0.1, group=g2)
+
+g3 = "3. DÉCIDER — Déclencheur"
+maxExtATR   = input.float(1.5, "Écart max prix / EMA21 (x ATR)", minval=0.5, step=0.1, group=g3)
+cooldown    = input.int(5, "Cooldown après clôture d'un trade (barres)", minval=0, group=g3)
+maxTradesDay = input.int(3, "Max trades par jour", minval=1, group=g3)
+
+g4 = "4. AGIR — SL / TP / Risque"
+slLookback = input.int(10, "Lookback swing pour le SL (barres)", minval=3, group=g4)
+slBuffer   = input.float(0.3, "Buffer SL au-delà du swing (x ATR)", minval=0.0, step=0.1, group=g4)
+slMinATR   = input.float(1.0, "Distance SL minimale (x ATR)", minval=0.1, step=0.1, group=g4)
+slMaxATR   = input.float(2.5, "Distance SL maximale (x ATR) — sinon pas de trade", minval=0.5, step=0.1, group=g4)
+rr1        = input.float(1.0, "TP1 — ratio R:R", minval=0.1, step=0.1, group=g4)
+rr2        = input.float(2.0, "TP2 — ratio R:R", minval=0.2, step=0.1, group=g4)
+tp1Pct     = input.int(50, "% de la position clôturée au TP1", minval=10, maxval=90, group=g4)
+moveBE     = input.bool(true, "SL à break-even après TP1", group=g4)
+riskPct    = input.float(1.0, "Risque par trade (% du capital)", minval=0.1, maxval=5.0, step=0.1, group=g4)
+
+g5 = "Période du backtest"
+startDate = input.time(timestamp("2024-01-01T00:00:00"), "Début", group=g5)
+endDate   = input.time(timestamp("2030-01-01T00:00:00"), "Fin",   group=g5)
+
+// ----------------------------------------------------------------------------
+// 1) OBSERVER
+// ----------------------------------------------------------------------------
+htfFast  = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfFastLen)[1], lookahead=barmerge.lookahead_on)
+htfSlow  = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfSlowLen)[1], lookahead=barmerge.lookahead_on)
+htfClose = request.security(syminfo.tickerid, htfTf, close[1], lookahead=barmerge.lookahead_on)
+
+ema21    = ta.ema(close, emaLen)
+emaTrend = ta.ema(close, emaTrendLen)
+vwapV    = ta.vwap(hlc3)
+atr      = ta.atr(atrLen)
+atrAvg   = ta.sma(atr, 100)
+volRatio = atrAvg > 0 ? atr / atrAvg : 1.0
+rsi      = ta.rsi(close, rsiLen)
+[diP, diM, adx] = ta.dmi(adxLen, adxLen)
+[macdL, macdS, macdH] = ta.macd(close, 12, 26, 9)
+
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+var float ph1 = na
+var float ph2 = na
+var float pl1 = na
+var float pl2 = na
+if not na(ph)
+    ph2 := ph1
+    ph1 := ph
+if not na(pl)
+    pl2 := pl1
+    pl1 := pl
+higherLows = pl1 > pl2
+lowerHighs = ph1 < ph2
+
+// ----------------------------------------------------------------------------
+// 2) ORIENTER
+// ----------------------------------------------------------------------------
+htfBull = htfFast > htfSlow and htfClose > htfFast
+htfBear = htfFast < htfSlow and htfClose < htfFast
+locBull = close > emaTrend and ema21 > emaTrend
+locBear = close < emaTrend and ema21 < emaTrend
+adxOk   = adx > adxMin
+vwapBull = not na(vwapV) and close > vwapV
+vwapBear = not na(vwapV) and close < vwapV
+
+bullScore = (htfBull ? 25 : 0) + (locBull ? 15 : 0) + (adxOk and diP > diM ? 15 : 0) + (rsi > 50 and rsi < 70 ? 10 : 0) + (macdH > 0 and macdH > macdH[1] ? 10 : 0) + (vwapBull ? 10 : 0) + (higherLows ? 15 : 0)
+bearScore = (htfBear ? 25 : 0) + (locBear ? 15 : 0) + (adxOk and diM > diP ? 15 : 0) + (rsi < 50 and rsi > 30 ? 10 : 0) + (macdH < 0 and macdH < macdH[1] ? 10 : 0) + (vwapBear ? 10 : 0) + (lowerHighs ? 15 : 0)
+
+inSession = not useSession or not na(time(timeframe.period, sessionStr, "UTC"))
+volOk     = volRatio >= volMin and volRatio <= volMax
+inRange   = time >= startDate and time <= endDate
+
+// ----------------------------------------------------------------------------
+// 3) DÉCIDER
+// ----------------------------------------------------------------------------
+body      = math.abs(close - open)
+lowerWick = math.min(open, close) - low
+upperWick = high - math.max(open, close)
+
+touchedLong  = ta.lowest(low, 3) <= ema21
+touchedShort = ta.highest(high, 3) >= ema21
+trigLong  = touchedLong  and close > ema21 and close > open and (close > high[1] or lowerWick >= body * 1.5)
+trigShort = touchedShort and close < ema21 and close < open and (close < low[1]  or upperWick >= body * 1.5)
+
+notExtLong  = (close - ema21) <= atr * maxExtATR
+notExtShort = (ema21 - close) <= atr * maxExtATR
+
+swLow  = ta.lowest(low, slLookback)
+swHigh = ta.highest(high, slLookback)
+riskLong  = math.max(close - (swLow - atr * slBuffer), atr * slMinATR)
+riskShort = math.max((swHigh + atr * slBuffer) - close, atr * slMinATR)
+riskOkLong  = riskLong  <= atr * slMaxATR
+riskOkShort = riskShort <= atr * slMaxATR
+
+// ----------------------------------------------------------------------------
+// 4) AGIR
+// ----------------------------------------------------------------------------
+var bool  inTrade = false
+var int   dir = 0
+var int   entryBar = 0
+var int   closedAtEntry = 0
+var int   lastCloseBar = -1000
+var int   dayTrades = 0
+var float eP = na
+var float slP = na
+var float tp1P = na
+var float tp2P = na
+
+if timeframe.change("D")
+    dayTrades := 0
+
+// Trade terminé ? (la position est revenue à zéro après la barre d'entrée)
+if inTrade and bar_index > entryBar and strategy.position_size == 0
+    inTrade := false
+    dir := 0
+    lastCloseBar := bar_index
+
+tp1Done = inTrade and strategy.closedtrades > closedAtEntry
+
+canEnter = not inTrade and barstate.isconfirmed and inRange and inSession and volOk and (bar_index - lastCloseBar > cooldown) and dayTrades < maxTradesDay and not na(htfSlow) and not na(atr)
+buySig  = canEnter and htfBull and bullScore >= minScore and trigLong  and notExtLong  and riskOkLong
+sellSig = canEnter and htfBear and bearScore >= minScore and trigShort and notExtShort and riskOkShort
+
+if buySig or sellSig
+    int   d    = buySig ? 1 : -1
+    float risk = buySig ? riskLong : riskShort
+    float qty  = strategy.equity * riskPct / 100.0 / (risk * syminfo.pointvalue)
+    dir := d
+    inTrade := true
+    entryBar := bar_index
+    closedAtEntry := strategy.closedtrades
+    dayTrades += 1
+    eP   := close
+    slP  := close - d * risk
+    tp1P := close + d * risk * rr1
+    tp2P := close + d * risk * rr2
+    strategy.entry(d == 1 ? "L" : "S", d == 1 ? strategy.long : strategy.short, qty=qty)
+
+// Ordres de sortie (ré-émis à chaque barre tant que le trade est actif)
+if inTrade
+    string id = dir == 1 ? "L" : "S"
+    float stopLvl = (moveBE and tp1Done) ? eP : slP
+    if tp1Done
+        strategy.cancel(id + "-TP1")
+        strategy.exit(id + "-TP2", id, limit=tp2P, stop=stopLvl)
+    else
+        strategy.exit(id + "-TP1", id, qty_percent=tp1Pct, limit=tp1P, stop=stopLvl)
+        strategy.exit(id + "-TP2", id, qty_percent=100 - tp1Pct, limit=tp2P, stop=stopLvl)
+
+// ----------------------------------------------------------------------------
+// AFFICHAGE
+// ----------------------------------------------------------------------------
+plot(ema21,    "EMA 21", color=color.new(color.orange, 0), linewidth=1)
+plot(emaTrend, "EMA 50", color=color.new(color.blue, 0),   linewidth=1)
+plot(inTrade ? ((moveBE and tp1Done) ? eP : slP) : na, "SL",  color=color.red,   style=plot.style_linebr, linewidth=2)
+plot(inTrade and not tp1Done ? tp1P : na,              "TP1", color=color.teal,  style=plot.style_linebr, linewidth=1)
+plot(inTrade ? tp2P : na,                              "TP2", color=color.green, style=plot.style_linebr, linewidth=2)
+bgcolor(htfBull ? color.new(color.green, 94) : htfBear ? color.new(color.red, 94) : na, title="Biais HTF")
