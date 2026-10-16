@@ -1,0 +1,10 @@
+__pycache__/
+.pytest_cache/
+bot_state.json
+bot_state.tmp
+bot_live.log
+journal.csv
+STOP
+data/
+config.json
+trades_*.csv
